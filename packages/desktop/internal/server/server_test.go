@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 
 	"github.com/xmwengxing/cfpilot/packages/desktop/internal/config"
@@ -160,6 +161,41 @@ func TestRejectsCrossSiteOrigin(t *testing.T) {
 	}
 	if code := doGet(t, base+"/", map[string]string{"Origin": "null"}); code != http.StatusForbidden {
 		t.Errorf("Origin=null 应 403，实际 %d", code)
+	}
+}
+
+// 回环别名必须视为同源。
+//
+// 实际故障形态（2026-11-12 反馈）：页面在 127.0.0.1，脚本请求却带
+// `Origin: http://localhost:19726`，旧的字符串比较把它判成跨站，
+// adapter.js / renderer.js 全部 403（text/plain），界面只剩一张空壳。
+func TestAcceptsLoopbackOriginAlias(t *testing.T) {
+	_, base := newTestServer(t)
+
+	port := base[strings.LastIndex(base, ":")+1:]
+	for _, origin := range []string{
+		"http://localhost:" + port,
+		"http://127.0.0.1:" + port,
+		// 实测：某些浏览器/代理会把 Origin 的端口整个省掉。
+		"http://127.0.0.1",
+		"http://localhost",
+	} {
+		if code := doGet(t, base+"/", map[string]string{"Origin": origin}); code != http.StatusOK {
+			t.Errorf("Origin=%q 应 200，实际 %d", origin, code)
+		}
+	}
+
+	// Host 被代理剥掉端口时，仍按服务实际端口校验 Origin。
+	if code := doGet(t, base+"/", map[string]string{
+		"Host":   "127.0.0.1",
+		"Origin": "http://127.0.0.1:" + port,
+	}); code != http.StatusOK {
+		t.Errorf("Host 缺端口时应按服务端口放行，实际 %d", code)
+	}
+
+	// 端口不一致仍然是跨站，必须拒绝。
+	if code := doGet(t, base+"/", map[string]string{"Origin": "http://127.0.0.1:1"}); code != http.StatusForbidden {
+		t.Errorf("Origin 端口不一致应 403，实际 %d", code)
 	}
 }
 

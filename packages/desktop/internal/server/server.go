@@ -535,11 +535,15 @@ func (s *Server) withCommonHeaders(next http.Handler) http.Handler {
 
 		// Host 校验：防 DNS Rebinding
 		if !hostAllowed(r.Host, allowLAN) {
+			// 把被拒的 Host 写进日志：静态资源 403 时界面只看到
+			// 「脚本被拒绝执行」，没有这条日志根本不知道是谁拦的。
+			s.logLevel(fmt.Sprintf("拒绝非法 Host %q（路径 %s，AllowLAN=%v）", r.Host, r.URL.Path, allowLAN), "err")
 			http.Error(w, "非法 Host", http.StatusForbidden)
 			return
 		}
 		// 同源校验：带 Origin 时必须是同 Host
 		if origin := r.Header.Get("Origin"); origin != "" && !s.originAllowed(origin, r.Host) {
+			s.logLevel(fmt.Sprintf("拒绝跨站 Origin %q（Host %q，路径 %s）", origin, r.Host, r.URL.Path), "err")
 			http.Error(w, "非法 Origin", http.StatusForbidden)
 			return
 		}
@@ -645,13 +649,58 @@ func (s *Server) hasValidSession(r *http.Request) bool {
 	return subtle.ConstantTimeCompare([]byte(c.Value), []byte(want)) == 1
 }
 
-func (s *Server) originAllowed(origin, host string) bool {
+// canonicalOriginHost 把回环别名归一成同一身份。
+//
+// 浏览器/代理/扩展可能把 `localhost` 与 `127.0.0.1` 混用：
+// 页面在 `http://127.0.0.1:19726`，脚本或 fetch 却带
+// `Origin: http://localhost:19726`（或反过来）。两者都是本机回环，
+// 语义上是同源，不能按字符串直接比较判成跨站。
+func canonicalOriginHost(host string) string {
+	h := strings.ToLower(strings.Trim(host, "[]"))
+	switch h {
+	case "localhost", "::1", "0:0:0:0:0:0:0:1":
+		return "127.0.0.1"
+	}
+	return h
+}
+
+func (s *Server) originAllowed(origin, hostport string) bool {
 	// Origin 形如 http://127.0.0.1:19726
 	const p = "http://"
-	if !strings.HasPrefix(origin, p) {
+	if !strings.HasPrefix(strings.ToLower(origin), p) {
 		return false
 	}
-	return strings.EqualFold(strings.TrimPrefix(origin, p), host)
+	rest := origin[len(p):]
+	originHost, originPort, err := net.SplitHostPort(rest)
+	if err != nil {
+		originHost, originPort = rest, ""
+	}
+	host, port, err := net.SplitHostPort(hostport)
+	if err != nil {
+		host, port = hostport, ""
+	}
+	if originHost == "" || canonicalOriginHost(originHost) != canonicalOriginHost(host) {
+		return false
+	}
+	// 端口也要对上：`http://127.0.0.1:9999` 不能操作本服务。
+	// Host 缺端口时按服务实际端口处理 —— 有的代理会剥掉 Host 的端口，
+	// 而浏览器给出的 Origin 仍带端口，直接比较会误判成跨站。
+	//
+	// ⚠️ Origin 也可能**整体不带端口**（实测 `Origin: http://127.0.0.1`，
+	// 页面实际在 :19726）。这是某些浏览器/代理/扩展的序列化行为，
+	// 对回环主机按服务端口处理；非回环主机仍按 http 默认 80，
+	// 避免把 `http://192.168.1.10`（:80）当成同源。
+	if originPort == "" {
+		if canonicalOriginHost(originHost) == "127.0.0.1" {
+			originPort = strconv.Itoa(s.port())
+		} else {
+			originPort = "80"
+		}
+	}
+	if port == "" {
+		port = strconv.Itoa(s.port())
+	}
+	return originPort == port
 }
 
 // ---------- handlers ----------
